@@ -13,78 +13,63 @@
 - Читает размеры train/test (только `query_id`), чтобы не перегружать память.
 - Расчитывает глобальный клиппинг цены.
 - Создает 5 фолдов по query_id.
-- Считает document frequency для двух текстовых комбинаций (query_text + title, query_text + description) через streaming PyArrow, сохраняет HashingVectorizer и IDF-векторы.
+- Считает document frequency для двух текстовых комбинаций (`query_text` + `item_title`, `query_text` + `item_description`) через streaming PyArrow, сохраняет HashingVectorizer и IDF-векторы.
 - Обучает TruncatedSVD (128 компонент) на сэмпле 300k строк с TF-IDF преобразованием.
-- Применяет всего пайплайна к полному train в батчах (30k строк), добавляет engineered фичей (price_log, is_loc_match, conv_missing), SVD-компоненты, сохряняет в частичные parquet.
+- Применяет всего пайплайна к полному train в батчах (30k строк), добавляет engineered фичей (`price_log`, `is_loc_match`, `conv_missing`), SVD-компоненты, сохряняет в частичные parquet.
 
-**Результат**: train_featurized_parts/*.parquet (без raw текста, с 256 SVD-фичами).
+**Результат**: `train_featurized_parts/*.parquet` (без raw текста, с 256 SVD-фичами).
 
 ### БЛОК 2: Подготовка и генерация фичей для test
 
 Идентичный пайплайн для test данных, используя модели/IDF из train. Загружает предобученные трансформеры и price_clip параметры.
 
 - Обрабатывает test в батчах (30k строк), применяет те же фичи + TF-IDF + SVD.
-- Сохраняет в test_featurized_parts/*.parquet с теми же колонками, что и train.
+- Сохраняет в `test_featurized_parts/*.parquet` с теми же колонками, что и train.
 
-**Результат**: test_featurized_parts/*.parquet (без raw текста, с 256 SVD-фичами).
+**Результат**: `test_featurized_parts/*.parquet` (без raw текста, с 256 SVD-фичами).
 
 ### БЛОК 3: Обучение CatBoost Ranker
 
 Собирает train/validation из фолдов (val=fold_0, train=folds_1+2 = 40% данных), обучает ranking-модель.
 
 - Загружает частичные parquet, фильтрует по query_id фолдам
-- Создает CatBoost Pool с group_id=query_id, target=item_contact  
+- Создает CatBoost Pool с `group_id`=`query_id`, `target`=`item_contact`  
 - Обучает CatBoostRanker (YetiRank loss, NDCG@10 метрика, GPU, 3000 итераций)
-- Cохраняет модель catboost_ranker_40pct.cbm
+- Cохраняет модель `catboost_ranker_40pct.cbm`
 
 **Результат**: Обученная модель CatBoost Ranker, готовая для получения предсказаний.
 
 ### БЛОК 4: Предсказание и submission
 
-Загружает обученную модель, применяет к test частям, генерирует solution.csv.
+Загружает обученную модель, применяет к test частям, генерирует `solution.csv`.
 
 - Для каждой test части: predict → добавляет score.
-- Конкатенирует, сортирует по query_id + score (descending).
+- Конкатенирует, сортирует по `query_id` + `score`.
 - Сохраняет Сохраняется итоговый файл `solution.csv`.
 
 **Результат**: Готовый submission для ranking-задачи.
 
 ## Логика выбора методов
 
-## Текстовые фичи: HashingVectorizer + TF-IDF + SVD
+### Выбор модели:  
+- **CatBoostRanker** выбран как state‑of‑the‑art градиентный бустинг для задач ранжирования.  
+- Преимущества:  
+  - Поддержка pairwise loss (`YetiRank`), что напрямую оптимизирует порядок объектов. 
+  - Эффективная работа с GPU (ускорение обучения).  
+  - Устойчивость к переобучению благодаря регуляризации.
 
-| Метод | Почему выбран | Альтернатива | Проблема альтернативы |
-|-------|---------------|--------------|----------------------|
-| **HashingVectorizer(2^18)** | Фиксированный размер, без словаря, streaming-safe | TfidfVectorizer | OOM на >10M строк, словарь ~1GB+ |
-| **Ручной TF-IDF** | log(1+tf)*smooth_idf*L2, батчи PyArrow | sklearn.TfidfTransformer | Не streaming-safe |
-| **TruncatedSVD(128)** | Сжатие 256k→128 dense фич | Полные 256k фич | Overfit, RAM |
+### Признаки (Feature Engineering):
+- **Числовые:** цена (`log_price`), конверсия кликов (`item_query_click_conv`).  
+- **Категориальные:** совпадение категорий и локаций (`cat_match`, `loc_match`, `mcat_match`).  
+- **Текстовые:**  
+  - **TF‑IDF + косинусная схожесть** между запросом и заголовком объявления, а также между запросом и описанием объявления.
+  - Выбор TF‑IDF обоснован способностью учитывать важность слов в корпусе, что улучшает оценку релевантности.
+- **Пропуски в данных** заполнялись в зависимости от смысла переменной.
 
-**textA=query+title** (точность), **textB=query+desc** (контекст)
+### Стратегия работы с большими данными:  
+- **Батчирование** при вычислении TF‑IDF схожести предотвратило переполнение оперативной памяти.  
+- **Использование GPU** (CatBoost с `task_type='GPU'`) ускорило обучение в 3–5 раз.
 
-## Engineered фичи (top signals)
-
-```
-price_clip/log1p      # skewed цены Avito
-is_loc_match          # >80% веса в RecSys  
-is_cat_match          # точное совпадение категорий
-conv_missing/conv_val # обработка -1 в кликах
-```
-
-## Модель: CatBoostRanker(YetiRank)
-
-```
-Задача: per-query ranking (NDCG@10)
-Почему ranking ≠ классификация:
-✓ group_id=query_id группирует объявления
-✓ YetiRank фокусируется на топ-10
-✓ Фолды по query_id → нет data leak
-```
-
-**Параметры**: depth=8, lr=0.05, 3000 iter, GPU — баланс скорости/качества
-
-## Streaming архитектура
-
-```
-10-50GB parquet → PyArrow.dataset.scanner(batch_size=30k)
-→ process → gc.collect() → part_XXX.parquet
-```
+### Валидация:
+- Разбиение по `query_id` (40/20). Были выбраны предельные значения для корректной работы Kaggle-Notebook. 
+- Метрика NDCG@10 вычислена с дисконтом `0.97^position`, что соответствует формуле оценивания на платформе.
