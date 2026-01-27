@@ -1,7 +1,7 @@
 # ML_Avito
 
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
-![Machine Learning](https://img.shields.io/badge/ML-Classification-green)
+![Machine Learning](https://img.shields.io/badge/ML-Ranking-green)
 ![Status](https://img.shields.io/badge/Status-Completed-success)
 
 ## Структура кода и пояснения к нему
