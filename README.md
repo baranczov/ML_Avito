@@ -6,25 +6,27 @@
 
 ## Структура кода и пояснения к нему
 
-### БЛОК 1: Подготовка и генерация фич для train
+### БЛОК 1: Подготовка и генерация фичей для train (Без загрузки всего датасета в RAM)
 
 Этот блок выполняет предварительную подготовку данных и создает векторизацию текстовых фичей с использованием HashingVectorizer + TF-IDF + SVD. Он работает в 4 этапа:
 
-- Быстрый подсчет строк, вычисление глобального клиппинга цены (99.9-й перцентиль), создание 5 фолдов по query_id .
-- Считает document frequency для двух текстовых комбинаций (query_text + title, query_text + description) через streaming PyArrow, сохраняет HashingVectorizer и IDF-векторы .
-- Обучает TruncatedSVD (128 компонент) на сэмпле 300k строк с TF-IDF преобразованием .
-- Применяет весь пайплайн к полному train в батчах (30k строк), добавляет engineered фичи (price_log, is_loc_match, conv_missing), SVD-компоненты, сохраняет в частичные parquet .
+- Читает размеры train/test (только `query_id`), чтобы не перегружать память.
+- Расчитывает глобальный клиппинг цены.
+- Создает 5 фолдов по query_id.
+- Считает document frequency для двух текстовых комбинаций (query_text + title, query_text + description) через streaming PyArrow, сохраняет HashingVectorizer и IDF-векторы.
+- Обучает TruncatedSVD (128 компонент) на сэмпле 300k строк с TF-IDF преобразованием.
+- Применяет всего пайплайна к полному train в батчах (30k строк), добавляет engineered фичей (price_log, is_loc_match, conv_missing), SVD-компоненты, сохряняет в частичные parquet.
 
 **Результат**: train_featurized_parts/*.parquet (без raw текста, с 256 SVD-фичами).
 
-### БЛОК 2: Генерация фич для test
+### БЛОК 2: Подготовка и генерация фичей для test
 
 Идентичный пайплайн для test данных, используя модели/IDF из train. Загружает предобученные трансформеры и price_clip параметры.
 
 - Обрабатывает test в батчах (30k строк), применяет те же фичи + TF-IDF + SVD.
-- Сохраняет в test_featurized_parts/*.parquet с теми же колонками, что и train .
+- Сохраняет в test_featurized_parts/*.parquet с теми же колонками, что и train.
 
-**Ключевое**: Гарантирует одинаковые преобразования train/test для консистентности.
+**Результат**: test_featurized_parts/*.parquet (без raw текста, с 256 SVD-фичами).
 
 ### БЛОК 3: Обучение CatBoost Ranker
 
@@ -35,13 +37,17 @@
 - Обучает CatBoostRanker (YetiRank loss, NDCG@10 метрика, GPU, 3000 итераций)
 - Cохраняет модель catboost_ranker_40pct.cbm
 
+**Результат**: Обученная модель CatBoost Ranker, готовая для получения предсказаний.
+
 ### БЛОК 4: Предсказание и submission
 
 Загружает обученную модель, применяет к test частям, генерирует solution.csv.
 
 - Для каждой test части: predict → добавляет score.
 - Конкатенирует, сортирует по query_id + score (descending).
-- Сохраняет топ-N по query_id (query_id, item_id) в CSV.
+- Сохраняет Сохраняется итоговый файл `solution.csv`.
+
+**Результат**: Готовый submission для ranking-задачи.
 
 ## Логика выбора методов
 
