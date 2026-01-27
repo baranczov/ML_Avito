@@ -4,50 +4,46 @@
 ![Machine Learning](https://img.shields.io/badge/ML-Classification-green)
 ![Status](https://img.shields.io/badge/Status-Completed-success)
 
-# Структура кода и пояснения к нему
+## Структура кода и пояснения к нему
 
-## БЛОК 1: Подготовка и генерация фич для train
+### БЛОК 1: Подготовка и генерация фич для train
 
-```python
-# Этапы:
-# 0-2: Быстрый подсчет строк, price clip (99.9-й перцентиль), 5 фолдов по query_id
-# IDF: Streaming подсчет document frequency (PyArrow) для query+title/desc
-# SVD: Обучение TruncatedSVD(128) на сэмпле 300k строк  
-# FEAT: Полный train → engineered фичи + TF-IDF + SVD → train_featurized_parts/*.parquet
-```
+Этот блок выполняет предварительную подготовку данных и создает векторизацию текстовых фичей с использованием HashingVectorizer + TF-IDF + SVD. Он работает в 4 этапа:
 
-**Результат**: 256 SVD-фичи (A=query+title, B=query+desc) + price_log + matches + conv
+- Быстрый подсчет строк, вычисление глобального клиппинга цены (99.9-й перцентиль), создание 5 фолдов по query_id .
+- Считает document frequency для двух текстовых комбинаций (query_text + title, query_text + description) через streaming PyArrow, сохраняет HashingVectorizer и IDF-векторы .
+- Обучает TruncatedSVD (128 компонент) на сэмпле 300k строк с TF-IDF преобразованием .
+- Применяет весь пайплайн к полному train в батчах (30k строк), добавляет engineered фичи (price_log, is_loc_match, conv_missing), SVD-компоненты, сохраняет в частичные parquet .
 
-## БЛОК 2: Генерация фич для test
+**Результат**: train_featurized_parts/*.parquet (без raw текста, с 256 SVD-фичами).
 
-```python
-# Идентичный пайплайн: загружает train-модели (hv, idf, svd, price_clip)
-# test → те же фичи → test_featurized_parts/*.parquet
-```
+### БЛОК 2: Генерация фич для test
 
-**Ключевое**: Гарантия одинаковых преобразований train/test
+Идентичный пайплайн для test данных, используя модели/IDF из train. Загружает предобученные трансформеры и price_clip параметры.
 
-## БЛОК 3: Обучение CatBoost Ranker
+- Обрабатывает test в батчах (30k строк), применяет те же фичи + TF-IDF + SVD.
+- Сохраняет в test_featurized_parts/*.parquet с теми же колонками, что и train .
 
-```python
-# val=fold_0, train=folds_1+2 (40% данных)
-# Pool с group_id=query_id, target=item_contact
-# CatBoostRanker(YetiRank, NDCG@10, GPU) → catboost_ranker_40pct.cbm
-```
+**Ключевое**: Гарантирует одинаковые преобразования train/test для консистентности.
 
-**Особенности**: Стабильная сортировка mergesort, use_best_model=True
+### БЛОК 3: Обучение CatBoost Ranker
 
-## БЛОК 4: Предсказание и submission
+Собирает train/validation из фолдов (val=fold_0, train=folds_1+2 = 40% данных), обучает ranking-модель.
 
-```python
-# test_parts → predict → sort by (query_id, score desc) → solution.csv
-```
+- Загружает частичные parquet, фильтрует по query_id фолдам
+- Создает CatBoost Pool с group_id=query_id, target=item_contact  
+- Обучает CatBoostRanker (YetiRank loss, NDCG@10 метрика, GPU, 3000 итераций)
+- Cохраняет модель catboost_ranker_40pct.cbm
 
-**Результат**: Готовый submission для ranking-задачи (query_id, item_id)
+### БЛОК 4: Предсказание и submission
 
-***
+Загружает обученную модель, применяет к test частям, генерирует solution.csv.
 
-# Логика выбора методов
+- Для каждой test части: predict → добавляет score.
+- Конкатенирует, сортирует по query_id + score (descending).
+- Сохраняет топ-N по query_id (query_id, item_id) в CSV.
+
+## Логика выбора методов
 
 ## Текстовые фичи: HashingVectorizer + TF-IDF + SVD
 
@@ -61,7 +57,7 @@
 
 ## Engineered фичи (top signals)
 
-```python
+```
 price_clip/log1p      # skewed цены Avito
 is_loc_match          # >80% веса в RecSys  
 is_cat_match          # точное совпадение категорий
@@ -86,9 +82,3 @@ conv_missing/conv_val # обработка -1 в кликах
 10-50GB parquet → PyArrow.dataset.scanner(batch_size=30k)
 → process → gc.collect() → part_XXX.parquet
 ```
-
-**Почему не pandas**: `pd.read_parquet()` упадет с OOM
-
-**Бенчмарк**: Top-4 Kaggle Avito использовали hashing+SVD+GBDT [ссылка на writeup]
-
-**Итог**: Оптимальный пайплайн для Kaggle-scale RecSys (миллионы строк, sparse текст, ranking)
